@@ -1,0 +1,15 @@
+# Python virtual environment & cache
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Research notes, plans, reports, and reference papers (local only)
+teacher_note.txt
+KE_HOACH_NGHIEN_CUU.md
+ABLATION_RESULTS.md
+paper_text.txt
+*.pdf
+results_history.json
+CHANGELOG.md
