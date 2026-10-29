@@ -140,10 +140,45 @@ class FuzzyMOSWOController:
         self._out_mfs   = [{name: v[name].mf for name in self._out_terms[k]} for k, v in enumerate(self._out_vars)]
 
         self._rule_table = []
+        self.rule_labels = [
+            "R1: gx=LOW  & ir=LOW    -> Exploit-Balanced (ms=med, cf=med, ri=none, cr=med, eta=med, cp=none)",
+            "R2: gx=LOW  & ir=MEDIUM -> Exploit-Fine     (ms=sml, cf=high, ri=none, cr=med, eta=high, cp=none)",
+            "R3: gx=LOW  & ir=HIGH   -> Exploit-Strong   (ms=sml, cf=high, ri=none, cr=med, eta=high, cp=none)",
+            "R4: gx=MED  & dv=HIGH   -> Normal-Diverse   (ms=med, cf=med, ri=none, cr=med, eta=med, cp=none)",
+            "R5: gx=MED  & dv=MEDIUM -> Normal-Balanced  (ms=med, cf=med, ri=none, cr=med, eta=med, cp=none)",
+            "R6: gx=MED  & dv=LOW    -> Escape-Mild      (ms=lrg, cf=sml, ri=mild, cr=med, eta=med, cp=mild)",
+            "R7: gx=HIGH & dd=LOW    -> Escape-Strong    (ms=lrg, cf=sml, ri=strg, cr=high, eta=low, cp=high)",
+            "R8: gx=HIGH & dd=MEDIUM -> Escape-Moderate  (ms=lrg, cf=sml, ri=mild, cr=high, eta=low, cp=mild)",
+            "R9: gx=HIGH & dd=HIGH   -> Early-Search     (ms=med, cf=med, ri=none, cr=med, eta=med, cp=none)",
+        ]
         for r in rules:
             ants = [(in_index[t.parent.label], t.label) for t in r.antecedent_terms]
             cons = [(out_index[wt.term.parent.label], wt.term.label) for wt in r.consequent]
             self._rule_table.append((ants, cons))
+
+        self.reset_stats()
+
+    def reset_stats(self):
+        """Reset rule activation statistics for sensitivity & pruning analysis."""
+        self.rule_fire_counts = np.zeros(len(self._rule_table), dtype=int)
+        self.rule_fire_strength_sum = np.zeros(len(self._rule_table), dtype=float)
+        self.total_evals = 0
+        self.active_rules_mask = np.ones(len(self._rule_table), dtype=bool)
+
+    def get_rule_stats(self):
+        """Return firing frequency (%) and mean firing strength per rule."""
+        denom = max(1, self.total_evals)
+        stats = []
+        for idx, label in enumerate(self.rule_labels):
+            stats.append({
+                "rule_id": f"R{idx + 1}",
+                "description": label,
+                "fire_count": int(self.rule_fire_counts[idx]),
+                "fire_freq_pct": float(self.rule_fire_counts[idx] / denom * 100.0),
+                "mean_strength": float(self.rule_fire_strength_sum[idx] / denom),
+                "active": bool(self.active_rules_mask[idx]),
+            })
+        return stats
 
     def compute(self, iter_ratio: float, diversity: float, g_excess: float, dec_diversity: float):
         """
@@ -166,6 +201,7 @@ class FuzzyMOSWOController:
             float(np.clip(g_excess, 0.0, 1.0)),
             float(np.clip(dec_diversity, 0.0, 1.0)),
         ]
+        self.total_evals += 1
 
         # 1. Fuzzification
         mu_in = []
@@ -178,10 +214,14 @@ class FuzzyMOSWOController:
 
         # 2. Rule evaluation and aggregation
         act = [{name: 0.0 for name in self._out_terms[k]} for k in range(len(self._out_vars))]
-        for ants, cons in self._rule_table:
+        for r_idx, (ants, cons) in enumerate(self._rule_table):
+            if not self.active_rules_mask[r_idx]:
+                continue
             a = min(mu_in[vi][tn] for vi, tn in ants)
             if a <= 0.0:
                 continue
+            self.rule_fire_counts[r_idx] += 1
+            self.rule_fire_strength_sum[r_idx] += a
             for vo, tn in cons:
                 if a > act[vo][tn]:
                     act[vo][tn] = a

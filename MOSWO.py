@@ -111,7 +111,12 @@ class MOSWO:
         use_reinit: bool = True,
         use_obl: bool = True,
         obl_period: int = 5,
-        obl_frac: float = 0.30,
+        obl_frac: float = 0.25,
+        stagnant_limit: int = 2,
+        cauchy_scale: float = 0.05,
+        g_excess_threshold: float = 0.22,
+        use_arch_div: bool = False,
+        active_rules_mask=None,
         n_min: int = None,
         random_state: int = None,
         variant: str = None,
@@ -127,30 +132,40 @@ class MOSWO:
             use_reinit     = cfg["use_reinit"]
             use_obl        = cfg["use_obl"]
 
-        self.obj_func       = obj_func
-        self.n_dim          = n_dim
-        self.lb             = np.broadcast_to(np.asarray(lower_bound, dtype=float), (n_dim,)).copy()
-        self.ub             = np.broadcast_to(np.asarray(upper_bound, dtype=float), (n_dim,)).copy()
-        self.pop_size       = pop_size
-        self.max_iter       = max_iter
-        self.n_obj          = n_obj
-        self.archive_size   = archive_size
-        self.CR             = CR
-        self.use_vectorized = use_vectorized
-        self.use_adaptive   = use_adaptive
-        self.use_fuzzy      = use_fuzzy
-        self.use_cauchy     = use_cauchy
-        self.use_reinit     = use_reinit
-        self.use_obl        = use_obl
-        self.obl_period     = obl_period
-        self.obl_frac       = obl_frac
-        self.n_min          = n_min
-        self.rng            = np.random.default_rng(random_state)
+        self.obj_func           = obj_func
+        self.n_dim              = n_dim
+        self.lb                 = np.broadcast_to(np.asarray(lower_bound, dtype=float), (n_dim,)).copy()
+        self.ub                 = np.broadcast_to(np.asarray(upper_bound, dtype=float), (n_dim,)).copy()
+        self.pop_size           = pop_size
+        self.max_iter           = max_iter
+        self.n_obj              = n_obj
+        self.archive_size       = archive_size
+        self.CR                 = CR
+        self.use_vectorized     = use_vectorized
+        self.use_adaptive       = use_adaptive
+        self.use_fuzzy          = use_fuzzy
+        self.use_cauchy         = use_cauchy
+        self.use_reinit         = use_reinit
+        self.use_obl            = use_obl
+        self.obl_period         = obl_period
+        self.obl_frac           = obl_frac
+        self.stagnant_limit     = stagnant_limit
+        self.cauchy_scale       = cauchy_scale
+        self.g_excess_threshold = g_excess_threshold
+        self.use_arch_div       = use_arch_div
+        self.active_rules_mask  = active_rules_mask
+        self.n_min              = n_min
+        self.rng                = np.random.default_rng(random_state)
 
         if np.any(self.lb >= self.ub):
             raise ValueError("Lower bounds must be strictly less than upper bounds.")
 
         self._fuzzy = _get_fuzzy_controller() if use_fuzzy else None
+        if self._fuzzy is not None:
+            if active_rules_mask is not None:
+                self._fuzzy.active_rules_mask = np.asarray(active_rules_mask, dtype=bool)
+            else:
+                self._fuzzy.active_rules_mask = np.ones(len(self._fuzzy._rule_table), dtype=bool)
 
         # Number of front-position variables to preserve during partial reinit
         # The first (n_obj - 1) dimensions control front distribution,
@@ -409,9 +424,9 @@ class MOSWO:
                 break
         return combined_pop[selected], combined_objs[selected]
 
-    def _partial_reinit(self, pop: np.ndarray, objs: np.ndarray, n_reinit: int):
-        """Reinitialize only the g-controlling dimensions of the worst individuals."""
-        if n_reinit <= 0:
+    def _partial_reinit(self, pop: np.ndarray, objs: np.ndarray, n_reinit: int, archive_pop: np.ndarray = None):
+        """Coordinate/Leader-guided elitist partial reinitialization on g-controlling dimensions."""
+        if n_reinit <= 0 or self.n_dim <= self._n_front_vars:
             return pop, objs
 
         fronts = self.non_dominated_sort(objs)
@@ -423,15 +438,35 @@ class MOSWO:
         reinit_idx = worst_pool[:n_reinit]
 
         g_start = self._n_front_vars
+        n_g = self.n_dim - g_start
+        center_g = 0.5 * (self.lb[g_start:] + self.ub[g_start:])
+        span_g = self.ub[g_start:] - self.lb[g_start:]
+
         for idx in reinit_idx:
-            pop[idx][g_start:] = self.rng.uniform(self.lb[g_start:], self.ub[g_start:])
-        for idx in reinit_idx:
-            objs[idx] = self.obj_func(pop[idx])
+            x_trial = pop[idx].copy()
+            # Perturb 1 to 2 g-dimensions around leader/center or uniform escape
+            k_dims = min(n_g, int(self.rng.integers(1, 3)))
+            dims = self.rng.choice(np.arange(g_start, self.n_dim), size=k_dims, replace=False)
+            if archive_pop is not None and len(archive_pop) > 0 and self.rng.random() < 0.65:
+                leader = archive_pop[self.rng.integers(len(archive_pop))]
+                for d in dims:
+                    x_trial[d] = leader[d] + self.rng.normal(0.0, 0.08) * (self.ub[d] - self.lb[d])
+            else:
+                for d in dims:
+                    if self.rng.random() < 0.5:
+                        x_trial[d] = center_g[d - g_start] + self.rng.normal(0.0, 0.10) * span_g[d - g_start]
+                    else:
+                        x_trial[d] = self.rng.uniform(self.lb[d], self.ub[d])
+            x_trial = self._clip(x_trial)
+            f_trial = self.obj_func(x_trial)
+            if np.sum(f_trial) < np.sum(objs[idx]) or self.dominates(f_trial, objs[idx]):
+                pop[idx] = x_trial
+                objs[idx] = f_trial
 
         return pop, objs
 
     def _obl_escape(self, pop: np.ndarray, objs: np.ndarray, n_candidates: int, candidates=None) -> tuple:
-        """Opposition-Based Learning on g-controlling dimensions."""
+        """Opposition-Based Learning (full & coordinate-wise) on g-controlling dimensions."""
         if n_candidates <= 0 or self.n_dim <= self._n_front_vars:
             return pop, objs
 
@@ -442,11 +477,21 @@ class MOSWO:
         for idx in candidates:
             x_orig = pop[idx].copy()
             x_opp = x_orig.copy()
-            x_opp[g_start:] = self.lb[g_start:] + self.ub[g_start:] - x_orig[g_start:]
+            if self.rng.random() < 0.5:
+                # Full g-subspace quasi-opposition
+                mid = 0.5 * (self.lb[g_start:] + self.ub[g_start:])
+                opp = self.lb[g_start:] + self.ub[g_start:] - x_orig[g_start:]
+                x_opp[g_start:] = self.rng.uniform(np.minimum(mid, opp), np.maximum(mid, opp))
+            else:
+                # Single-coordinate opposition on most deviated g-dimension
+                d = int(self.rng.integers(g_start, self.n_dim))
+                mid_d = 0.5 * (self.lb[d] + self.ub[d])
+                opp_d = self.lb[d] + self.ub[d] - x_orig[d]
+                x_opp[d] = self.rng.uniform(min(mid_d, opp_d), max(mid_d, opp_d))
             x_opp = self._clip(x_opp)
 
             f_opp = self.obj_func(x_opp)
-            if np.sum(f_opp) < np.sum(objs[idx]):
+            if np.sum(f_opp) < np.sum(objs[idx]) or self.dominates(f_opp, objs[idx]):
                 pop[idx] = x_opp
                 objs[idx] = f_opp
 
@@ -560,38 +605,41 @@ class MOSWO:
             C = c_factor_val * 2.0 * (1.0 - progress)
 
             # Partial reinitialization for stuck populations
-            if g_excess_val < 0.4:
+            if g_excess_val < self.g_excess_threshold:
                 stagnant_threshold = 9999
-            elif g_excess_val < 0.7:
-                stagnant_threshold = 5
+            elif g_excess_val < 0.55:
+                stagnant_threshold = self.stagnant_limit + 1
             else:
-                stagnant_threshold = 3
+                stagnant_threshold = self.stagnant_limit
 
             if reinit_cooldown > 0:
                 reinit_cooldown -= 1
 
             if (self.use_fuzzy
                     and self.use_reinit
-                    and reinit_str_val > 0.3
+                    and (reinit_str_val > 0.15 or g_excess_val > self.g_excess_threshold)
                     and stagnant_gens >= stagnant_threshold
-                    and progress < 0.85
+                    and progress < 0.88
                     and reinit_cooldown == 0):
-                n_reinit = max(1, int(reinit_str_val * 0.20 * N))
-                pop, objs = self._partial_reinit(pop, objs, n_reinit)
+                eff_str = max(reinit_str_val, 0.35)
+                n_reinit = max(1, int(eff_str * 0.25 * N))
+                pop, objs = self._partial_reinit(pop, objs, n_reinit, archive_pop=archive_pop)
 
-                n_seeds = max(4, self.n_obj * n_reinit // 2)
-                archive_pop, archive_objs = self._archive_diversification_nd(
-                    archive_pop, archive_objs, n_seeds
-                )
+                if self.use_arch_div:
+                    n_seeds = max(4, self.n_obj * n_reinit // 2)
+                    archive_pop, archive_objs = self._archive_diversification_nd(
+                        archive_pop, archive_objs, n_seeds
+                    )
 
                 stagnant_gens = 0
-                reinit_cooldown = 5
+                reinit_cooldown = 3
 
             # Opposition-Based Learning escape
             if (self.use_fuzzy
                     and self.use_reinit
                     and self.use_obl
-                    and g_excess_val > 0.4
+                    and g_excess_val > self.g_excess_threshold
+                    and (stagnant_gens >= 1 or g_excess_val > 0.40)
                     and t % self.obl_period == 0
                     and progress < 0.90):
                 n_obl = max(1, int(self.obl_frac * N))
@@ -639,8 +687,8 @@ class MOSWO:
                     mu2 = B * np.cos(2 * np.pi * ell) * mu_scale_val
                     r2 = self.rng.random(self.n_dim)
                     new_pop[i] = (new_pop[i]
-                                  + mu2 * (self.lb + r2 * span_bounds)
-                                  + 0.1 * velocities[i])
+                                   + mu2 * (self.lb + r2 * span_bounds)
+                                   + 0.1 * velocities[i])
                 else:
                     if self.rng.random() > 0.5:
                         new_pop[i] = new_pop[i] + C * (2 * r5 * dist_vec)
@@ -667,18 +715,18 @@ class MOSWO:
                 # POLYNOMIAL MUTATION (Adaptive eta_m from fuzzy controller)
                 new_pop[i] = self._polynomial_mutation(new_pop[i], eta_m=eta_m_val, prob=1.0 / self.n_dim)
 
-                # CAUCHY MUTATION (Adaptive cauchy_prob from fuzzy controller; cp['none'] ≈ 0.0186 <= 0.05)
-                if self.use_cauchy and cauchy_prob_val > 0.05:
+                # CAUCHY MUTATION (Stagnation-gated single-coordinate heavy-tailed jump)
+                if (self.use_cauchy
+                        and cauchy_prob_val > 0.05
+                        and (stagnant_gens >= 1 or g_excess_val > 0.40)
+                        and progress < 0.90):
                     g_start = self._n_front_vars
                     n_g = self.n_dim - g_start
-                    if n_g > 0:
-                        c_mask = self.rng.random(n_g) < (cauchy_prob_val / n_g)
-                        if np.any(c_mask):
-                            scale = (self.ub[g_start:] - self.lb[g_start:]) * 0.05
-                            new_pop[i, g_start:][c_mask] += (
-                                self.rng.standard_cauchy(np.sum(c_mask)) * scale[c_mask]
-                            )
-                            new_pop[i] = self._clip(new_pop[i])
+                    if n_g > 0 and self.rng.random() < cauchy_prob_val:
+                        j_c = int(self.rng.integers(g_start, self.n_dim))
+                        scale_c = (self.ub[j_c] - self.lb[j_c]) * self.cauchy_scale * (1.0 - 0.5 * progress)
+                        new_pop[i, j_c] += self.rng.standard_cauchy() * scale_c
+                        new_pop[i] = self._clip(new_pop[i])
 
             # Step 4: EVALUATION & ARCHIVE UPDATE
             new_objs = self._evaluate(new_pop)
