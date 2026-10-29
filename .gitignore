@@ -9,6 +9,7 @@ __pycache__/
 teacher_note.txt
 KE_HOACH_NGHIEN_CUU.md
 ABLATION_RESULTS.md
+PARAMETER_STUDY_RESULTS.md
 paper_text.txt
 *.pdf
 results_history.json
