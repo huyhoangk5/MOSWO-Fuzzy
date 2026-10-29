@@ -71,3 +71,4 @@ Chạy đánh giá mô hình đầy đủ trên toàn bộ 12 bài toán chuẩn
 # Hoặc chỉ chạy trên một số bài toán cụ thể:
 .\.venv\Scripts\python.exe ablation_study.py --runs 5 --problems ZDT1 ZDT4 DTLZ1 DTLZ3
 ```
+
